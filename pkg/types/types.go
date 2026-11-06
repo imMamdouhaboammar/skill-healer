@@ -44,11 +44,18 @@ type Entity struct {
 	Name          string     `json:"name"`
 	Type          EntityType `json:"type"`
 	Domain        Domain     `json:"domain"`
+	Description   string     `json:"description,omitempty"`
+	Confidence    float64    `json:"classification_confidence,omitempty"`
+	Basis         string     `json:"classification_basis,omitempty"`
+	Source        string     `json:"discovery_source,omitempty"`
+	DuplicateOf   string     `json:"duplicate_of,omitempty"`
+	Attribution   string     `json:"usage_attribution,omitempty"`
 	Path          string     `json:"path"`
 	IsSymlink     bool       `json:"is_symlink"`
 	SymlinkTarget string     `json:"symlink_target,omitempty"`
 	Scope         string     `json:"scope"` // "global" | "project"
 	CallCount     int64      `json:"call_count"`
+	VerifiedCalls int64      `json:"verified_calls"`
 	FirstSeen     *time.Time `json:"first_seen,omitempty"`
 	LastSeen      *time.Time `json:"last_seen,omitempty"`
 	Tier          Tier       `json:"tier"`
@@ -60,6 +67,8 @@ type TelemetryRecord struct {
 	Name          string  `json:"name"`
 	Type          string  `json:"type"`
 	CallCount     int64   `json:"call_count"`
+	VerifiedCalls int64   `json:"verified_calls,omitempty"`
+	LastSource    string  `json:"last_source,omitempty"`
 	FirstSeen     float64 `json:"first_seen"`
 	LastSeen      float64 `json:"last_seen"`
 	DaysSinceLast float64 `json:"days_since_last"`
@@ -82,4 +91,12 @@ type Pool struct {
 	Agents    map[string]Entity `json:"agents"`
 	Total     int               `json:"total"`
 	ScannedAt time.Time         `json:"scanned_at"`
+	Coverage  CoverageReport    `json:"coverage"`
+}
+
+type CoverageReport struct {
+	Scanned            []string `json:"scanned"`
+	Skipped            []string `json:"skipped,omitempty"`
+	Warnings           []string `json:"warnings,omitempty"`
+	ProjectDirectories int      `json:"project_directories"`
 }

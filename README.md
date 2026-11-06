@@ -58,6 +58,63 @@ ash unload <skill-name>
 ash track <cli|mcp|skill|agent> <name>
 ```
 
+## Local dashboard & agent quick access
+
+Start the local web dashboard and open `http://127.0.0.1:4317` on this Mac
+
+```bash
+ash dashboard --port 4317
+```
+
+The dashboard includes Inventory, Hot tools, Quick access, Collections, Cleanup, Sources, Activity, Archived and Settings. Press `⌘K` for the command palette
+
+- Pin tools; add display aliases, tags and notes; hide them from normal lists
+- Save custom terminal commands, edit them, and copy them with one click. They are never executed automatically
+- Save collections that reference any discovered skill, MCP, CLI or agent
+- Preview discovered skill Markdown, reveal source paths in Finder and export inventory CSV or JSON
+- Clear saved metadata without changing installed tools
+- Physically remove eligible user-owned Skills, MCP bundles, and local CLI/Agent entries by moving their installed files into a private Trash vault
+- Unregister configured MCP servers by rewriting only their named entry in the relevant JSON configuration, with a local recovery backup
+- Review the exact source and operation before removal, enter the tool name to confirm, and restore it from Archived when needed
+- Select any number of tools across pages for bulk removal; review every source and type the batch count confirmation. Bulk Pin, Unpin, Hide and Unhide are also available
+- Select any number of removed tools in Trash for bulk Restore or permanent deletion with a separate typed confirmation
+- Unsupported package-managed CLIs, system binaries and virtual agents are blocked until a source-specific uninstall adapter is available. User-level macOS file permissions still apply
+- Move only eligible Gemini skill symlink aliases into standby, with confirmation and restore
+
+### Real cleanup from the CLI
+
+The local dashboard and CLI share the same on-disk Trash and recovery data. Every destructive CLI action requires an explicit confirmation and, for installed sources, the fingerprint returned by a fresh plan
+
+```bash
+# Inspect exact removal action, eligibility and source fingerprint
+ash cleanup plan --id 'skill:my-skill'
+
+# Move the installed source to ~/.ash/vault/trash
+ash cleanup remove --id 'skill:my-skill' --fingerprint '<fingerprint-from-plan>' --confirm 'my-skill'
+
+# List removed entries and their Trash record IDs
+ash cleanup trash
+
+# Recover an entry at its original source, refusing to overwrite existing files
+ash cleanup restore --id '<trash-record-id>'
+
+# Permanently delete the recovery copy, only after typed confirmation
+ash cleanup purge --id '<trash-record-id>' --confirm 'DELETE my-skill'
+```
+
+Bulk operations have no tool-count cap. The bulk API requires a verified plan for every entry before removal, and reports partial results if a later source fails. Large confirmed operations may take longer to complete
+
+Saved preferences are kept in `~/.ash/db/dashboard.json` with user-only file permissions
+
+Agents can read the same saved preferences without opening the browser
+
+```bash
+ash quick
+ash quick --json
+```
+
+For reference analysis and deferred capabilities, see [REFERENCE-NOTES.md](REFERENCE-NOTES.md)
+
 ## Attribution & Author
 
 - **Author**: Mamdouh Aboammar

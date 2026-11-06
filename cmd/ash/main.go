@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/imMamdouhaboammar/skill-healer/pkg/healer"
+	"github.com/imMamdouhaboammar/skill-healer/pkg/instrument"
 	"github.com/imMamdouhaboammar/skill-healer/pkg/scanner"
 	"github.com/imMamdouhaboammar/skill-healer/pkg/telemetry"
 	"github.com/imMamdouhaboammar/skill-healer/pkg/types"
@@ -38,6 +40,15 @@ func main() {
 	args := os.Args[2:]
 
 	switch cmd {
+	case "dashboard":
+		runDashboard(args)
+	case "cleanup":
+		if err := cleanupCommand(args, os.Stdout); err != nil {
+			fmt.Fprintf(os.Stderr, "Cleanup error: %v\n", err)
+			os.Exit(1)
+		}
+	case "quick":
+		runQuick(args)
 	case "pool":
 		runPool(args)
 	case "stats":
@@ -48,6 +59,10 @@ func main() {
 		runDormant(args)
 	case "track":
 		runTrack(args)
+	case "hook":
+		runHook(args)
+	case "instrument":
+		runInstrument(args)
 	case "dedupe":
 		runDedupe(args)
 	case "quiet":
@@ -75,6 +90,9 @@ func printHelp() {
   ash <command> [options] [arguments]
 
 Management & Discovery:
+  dashboard       Start the local management dashboard (--port 4317)
+  cleanup         Plan, remove, restore or permanently delete eligible tools
+  quick           Show pinned tools, commands and collections (--json for agents)
   pool            Display full inventory of CLIs, MCPs, Skills, and Agents
   stats           Display Lifetime Lite Counter statistics and telemetry
   top             Display top most-invoked entities across all categories
@@ -82,13 +100,15 @@ Management & Discovery:
   doctor          Run health check on symlinks, paths, and configurations
 
 Healing & Noise Control:
-  dedupe          Deduplicate redundant physical directories via canonical symlinks (--dry-run supported)
-  quiet           Activate lean Active Set; move dormant skills to On-Demand Standby (--dry-run supported)
+  dedupe          Preview identical physical skill copies; --apply archives originals and links them
+  quiet           Preview optional standby moves; --apply moves eligible symbolic links
   load <skill>    Dynamically mount any skill into Active Set in 1ms
   unload <skill>  Unmount a skill from Active Set back to Standby
 
 Telemetry:
   track <t> <n>   Record an invocation (t = cli|mcp|skill|agent, n = name)
+  hook claude     Receive observed events from Claude Code via stdin
+  instrument      Set up host tracking (claude install|status, cli install|status)
   version         Show ash version and architecture`)
 }
 
@@ -163,15 +183,17 @@ func runStats(args []string) {
 
 	typeCounts := make(map[string]int)
 	tierCounts := make(map[string]int)
-	var totalCalls int64 = 0
+	var totalCalls, observedCalls int64
 
 	for _, rec := range db.Entities {
 		typeCounts[rec.Type]++
 		tierCounts[rec.Tier]++
 		totalCalls += rec.CallCount
+		observedCalls += rec.VerifiedCalls
 	}
 
-	fmt.Printf("Lifetime Invocations: %d calls across all tools\n\n", totalCalls)
+	fmt.Printf("Imported + reported calls: %d (historical provenance not audited)\n", totalCalls)
+	fmt.Printf("Host-observed calls:       %d (instrumented events only)\n\n", observedCalls)
 	fmt.Println("Breakdown by Activity Tier:")
 	for tier, count := range tierCounts {
 		fmt.Printf("  • %-8s: %d entities\n", tier, count)
@@ -259,17 +281,112 @@ func runTrack(args []string) {
 	fmt.Printf("Recorded call for [%s] %s -> Lifetime Calls: %d (Tier: %s)\n", etype, name, rec.CallCount, rec.Tier)
 }
 
+func runHook(args []string) {
+	if len(args) == 2 && args[0] == "cli" {
+		if _, err := telemetry.RecordObservedInvocation("", types.TypeCLI, args[1], "path-shim"); err != nil {
+			fmt.Fprintln(os.Stderr, "ash cli hook:", err)
+		}
+		return
+	}
+	if len(args) != 1 || args[0] != "claude" {
+		fmt.Fprintln(os.Stderr, "Usage: ash hook claude | ash hook cli <name>")
+		os.Exit(1)
+	}
+	// Hooks must never block the user's agent. Fail open while logging errors.
+	input, err := io.ReadAll(io.LimitReader(os.Stdin, 8<<20))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "ash hook read:", err)
+		return
+	}
+	obs, valid, err := instrument.ParseClaudeHook(input)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "ash hook decode:", err)
+		return
+	}
+	if !valid {
+		return
+	}
+	if _, err = telemetry.RecordObservedInvocation("", obs.Type, obs.Name, obs.Source); err != nil {
+		fmt.Fprintln(os.Stderr, "ash hook record:", err)
+	}
+}
+
+func runInstrument(args []string) {
+	if len(args) < 2 || (args[0] != "claude" && args[0] != "cli") || (args[1] != "install" && args[1] != "status") {
+		fmt.Fprintln(os.Stderr, "Usage: ash instrument claude install|status OR ash instrument cli install|status [names...]")
+		os.Exit(1)
+	}
+	binary, err := os.Executable()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	binary, err = filepath.Abs(binary)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	if args[0] == "cli" {
+		shims := instrument.CLIShimsDir()
+		if args[1] == "status" {
+			fmt.Println("CLI shims:", shims)
+			fmt.Println("PATH starts with shims:", strings.HasPrefix(os.Getenv("PATH"), shims+string(os.PathListSeparator)))
+			return
+		}
+		if len(args) < 3 {
+			fmt.Fprintln(os.Stderr, "Specify CLI names, e.g. ash instrument cli install claude gh bun")
+			os.Exit(1)
+		}
+		for _, name := range args[2:] {
+			wrapper, err := instrument.InstallCLIShim(shims, binary, name)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Cannot instrument %s: %v\n", name, err)
+				os.Exit(1)
+			}
+			fmt.Println("Installed CLI tracking shim:", wrapper)
+		}
+		changed, err := instrument.EnableZshShims("", shims)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Shims installed, PATH setup failed:", err)
+			os.Exit(1)
+		}
+		if changed {
+			fmt.Println("Updated ~/.zshrc with backup ~/.zshrc.ash-backup")
+		}
+		fmt.Println("Open a new terminal; agents need to inherit the updated PATH to use CLI shims")
+		return
+	}
+	if args[1] == "install" {
+		backup, err := instrument.InstallClaudeHooks("", binary)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Claude hook installation failed:", err)
+			os.Exit(1)
+		}
+		if backup != "" {
+			fmt.Println("Original settings backup:", backup)
+		}
+	}
+	enabled, err := instrument.ClaudeHooksInstalled("", binary)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	fmt.Printf("Claude Code recording: %v\nHooks: PostToolUse + PostToolUseFailure (MCP/Skill), SubagentStart (agents)\n", enabled)
+}
+
 func runDedupe(args []string) {
 	fs := flag.NewFlagSet("dedupe", flag.ExitOnError)
 	dryRun := fs.Bool("dry-run", false, "Preview deduplication without mutating disk")
+	apply := fs.Bool("apply", false, "Archive identical source folders and replace with canonical symlinks")
 	_ = fs.Parse(args)
+	preview := *dryRun || !*apply
 
-	fmt.Printf("=== AGentic Skills Healer: Deduplication Engine ===\n")
-	if *dryRun {
-		fmt.Println("[DRY-RUN MODE] No files will be modified.")
+	fmt.Printf("=== AGentic Skills Healer: Safe Duplicate Review ===\n")
+	if preview {
+		fmt.Println("[PREVIEW] No files will be modified. Use --apply to archive identical copies and link them")
 	}
 
-	res, err := healer.Dedupe(*dryRun)
+	res, err := healer.Dedupe(preview)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Deduplication error: %v\n", err)
 		os.Exit(1)
@@ -277,31 +394,39 @@ func runDedupe(args []string) {
 
 	fmt.Printf("Total Scanned in ~/.gemini/config/skills: %d\n", res.TotalScanned)
 	fmt.Printf("Already Symlinks:                        %d\n", res.AlreadyLinks)
-	fmt.Printf("Converted Real Directories to Symlinks:  %d\n", res.Converted)
-	fmt.Printf("Stale Backup Artifacts Cleaned:          %d\n", res.StaleRemoved)
+	fmt.Printf("Identical Copies %s: %d\n", map[bool]string{true: "Eligible", false: "Archived & Linked"}[preview], res.Converted)
+	fmt.Printf("Different Content Kept: %d\n", res.SkippedDifferent)
+	fmt.Printf("Unsafe or Backup Entries Skipped: %d\n", res.SkippedUnsafe)
+	for _, backup := range res.Backups {
+		fmt.Printf("Recovery copy retained: %s\n", backup)
+	}
 	if len(res.Errors) > 0 {
 		fmt.Printf("Errors encountered (%d):\n", len(res.Errors))
 		for _, e := range res.Errors {
 			fmt.Printf("  ! %s\n", e)
 		}
+	} else if preview {
+		fmt.Println("Preview complete. Matching names with different content were left untouched")
 	} else {
-		fmt.Println("All duplicate directories successfully unified with canonical store!")
+		fmt.Println("Done. Original copies remain in the recovery vault")
 	}
 }
 
 func runQuiet(args []string) {
 	fs := flag.NewFlagSet("quiet", flag.ExitOnError)
 	dryRun := fs.Bool("dry-run", false, "Preview quiet mode without moving files")
+	apply := fs.Bool("apply", false, "Move eligible symbolic links to standby after review")
 	minCalls := fs.Int("min-calls", 10, "Minimum calls for a skill to remain active (default: 10)")
 	_ = fs.Parse(args)
+	preview := *dryRun || !*apply
 
 	db, _ := telemetry.Load("")
-	fmt.Printf("=== AGentic Skills Healer: Quiet Mode Optimization ===\n")
-	if *dryRun {
-		fmt.Printf("[DRY-RUN MODE] Previewing Active Set vs Standby (min-calls: %d)...\n", *minCalls)
+	fmt.Printf("=== AGentic Skills Healer: Standby Review ===\n")
+	if preview {
+		fmt.Printf("[PREVIEW] No files will be changed (min-calls: %d). Use --apply to move eligible aliases\n", *minCalls)
 	}
 
-	res, err := healer.Quiet(*dryRun, *minCalls, db)
+	res, err := healer.Quiet(preview, *minCalls, db)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Quiet mode error: %v\n", err)
 		os.Exit(1)
@@ -309,9 +434,11 @@ func runQuiet(args []string) {
 
 	fmt.Printf("Total Skills Before:       %d\n", res.TotalBefore)
 	fmt.Printf("Kept in Active Set (HOT):   %d\n", res.KeptActive)
-	fmt.Printf("Moved to Standby Vault:    %d\n", res.MovedStandby)
-	noiseCut := float64(res.MovedStandby) / float64(res.TotalBefore) * 100
-	fmt.Printf("Context Prompt Noise Cut:  %.1f%%\n", noiseCut)
+	fmt.Printf("Eligible Standby Moves:    %d\n", res.MovedStandby)
+	fmt.Printf("Skipped Without Changes:   %d\n", res.Skipped)
+	for _, message := range res.Errors {
+		fmt.Printf("  ! %s\n", message)
+	}
 }
 
 func runLoad(args []string) {
@@ -326,8 +453,7 @@ func runLoad(args []string) {
 		fmt.Fprintf(os.Stderr, "Error mounting skill: %v\n", err)
 		os.Exit(1)
 	}
-	// Record telemetry
-	_, _ = telemetry.RecordInvocation("", types.TypeSkill, skillName)
+	// Mounting a skill is a configuration change, not evidence of usage.
 	fmt.Printf("Mounted skill '%s' into Active Set in %s (Ready for use by any agent)\n", skillName, time.Since(t0))
 }
 

@@ -2,9 +2,24 @@ package classifier
 
 import (
 	"strings"
+	"unicode"
 
 	"github.com/imMamdouhaboammar/skill-healer/pkg/types"
 )
+
+// Result explains which domain rule matched and why.
+type Result struct {
+	Domain     types.Domain
+	Confidence float64
+	Basis      string
+	Evidence   []string
+}
+
+var domainPriority = []types.Domain{
+	types.DomainSecurity, types.DomainReverseEng, types.DomainTesting,
+	types.DomainDevOps, types.DomainAI, types.DomainContent,
+	types.DomainFrontend, types.DomainBackend, types.DomainOrchestration,
+}
 
 var domainKeywords = map[types.Domain][]string{
 	types.DomainFrontend: {
@@ -44,7 +59,7 @@ var domainKeywords = map[types.Domain][]string{
 	types.DomainSecurity: {
 		"secur", "safety", "auth", "jwt", "gitleaks", "secret", "hipaa", "pci", "gdpr",
 		"stride", "threat", "bounty", "sast", "penetration", "firewall", "hardening",
-		"permission", "turnstile", "sandbox", "vulnerability",
+		"permission", "turnstile", "sandbox", "vulnerability", "credential", "access control",
 	},
 	types.DomainAI: {
 		"deep-learning", "machine-learning", "pytorch", "jax", "transformers", "pandas",
@@ -64,17 +79,77 @@ var domainKeywords = map[types.Domain][]string{
 	},
 }
 
-// ClassifyName maps an identifier or name into one of the 9 canonical domains.
-func ClassifyName(name string) types.Domain {
-	low := strings.ToLower(name)
+func words(value string) string {
+	parts := strings.FieldsFunc(strings.ToLower(value), func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	})
+	return " " + strings.Join(parts, " ") + " "
+}
 
-	for domain, keywords := range domainKeywords {
-		for _, kw := range keywords {
-			if strings.Contains(low, kw) {
-				return domain
+func containsTerm(text, term string) bool {
+	if strings.Contains(text, " "+strings.TrimSpace(words(term))+" ") {
+		return true
+	}
+	for _, stem := range []string{"secur", "orchestrat", "profil"} {
+		if term != stem {
+			continue
+		}
+		for _, word := range strings.Fields(text) {
+			if strings.HasPrefix(word, stem) {
+				return true
 			}
 		}
 	}
+	return false
+}
 
-	return types.DomainGeneral
+// ClassifyDetailed provides deterministic weighted matching over words and descriptions.
+// Confidence describes rule strength, not a calibrated statistical probability.
+func ClassifyDetailed(name, description string) Result {
+	normalizedName, normalizedDescription := words(name), words(description)
+	best := Result{Domain: types.DomainGeneral, Basis: "unclassified"}
+	bestScore := 0
+	for _, domain := range domainPriority {
+		score := 0
+		evidence := make([]string, 0, 3)
+		for _, keyword := range domainKeywords[domain] {
+			if containsTerm(normalizedName, keyword) {
+				score += 2
+				evidence = append(evidence, "name:"+keyword)
+			}
+			if containsTerm(normalizedDescription, keyword) {
+				score += 4
+				evidence = append(evidence, "description:"+keyword)
+			}
+		}
+		if score > bestScore {
+			strength := 0.5 + float64(score)*0.045
+			if strength > 0.95 {
+				strength = 0.95
+			}
+			basis := "name"
+			if containsEvidencePrefix(evidence, "description:") {
+				basis = "description"
+			}
+			if containsEvidencePrefix(evidence, "description:") && containsEvidencePrefix(evidence, "name:") {
+				basis = "name+description"
+			}
+			best = Result{Domain: domain, Confidence: strength, Basis: basis, Evidence: evidence}
+			bestScore = score
+		}
+	}
+	return best
+}
+
+func containsEvidencePrefix(evidence []string, prefix string) bool {
+	for _, entry := range evidence {
+		if strings.HasPrefix(entry, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func ClassifyName(name string) types.Domain {
+	return ClassifyDetailed(name, "").Domain
 }
