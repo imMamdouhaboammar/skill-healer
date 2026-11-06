@@ -13,7 +13,7 @@ import (
 )
 
 // ScanPool performs a full system scan of all Skills, MCPs, CLIs, and Agents.
-func ScanPool(db *types.TelemetryDB) (*types.Pool, error) {
+func scanLegacyPool(db *types.TelemetryDB) (*types.Pool, error) {
 	home, _ := os.UserHomeDir()
 
 	pool := &types.Pool{
@@ -58,12 +58,14 @@ func ScanPool(db *types.TelemetryDB) (*types.Pool, error) {
 
 			// Telemetry lookup
 			var callCount int64 = 0
+			var verifiedCalls int64 = 0
 			tier := types.TierDormant
 			var firstSeen, lastSeen *time.Time
 
 			if db != nil {
 				if rec, ok := telemetry.GetRecord(db, types.TypeSkill, name); ok {
 					callCount = rec.CallCount
+					verifiedCalls = rec.VerifiedCalls
 					tier = types.Tier(rec.Tier)
 					if rec.FirstSeen > 0 {
 						t1 := time.Unix(int64(rec.FirstSeen), 0)
@@ -86,6 +88,7 @@ func ScanPool(db *types.TelemetryDB) (*types.Pool, error) {
 				SymlinkTarget: symlinkTarget,
 				Scope:         sd.Scope,
 				CallCount:     callCount,
+				VerifiedCalls: verifiedCalls,
 				FirstSeen:     firstSeen,
 				LastSeen:      lastSeen,
 				Tier:          tier,
@@ -113,24 +116,27 @@ func ScanPool(db *types.TelemetryDB) (*types.Pool, error) {
 		if err := json.Unmarshal(data, &parsed); err == nil {
 			for sname := range parsed.MCPServers {
 				var callCount int64 = 0
+				var verifiedCalls int64 = 0
 				tier := types.TierDormant
 				if db != nil {
 					if rec, ok := telemetry.GetRecord(db, types.TypeMCP, sname); ok {
 						callCount = rec.CallCount
+						verifiedCalls = rec.VerifiedCalls
 						tier = types.Tier(rec.Tier)
 					}
 				}
 
 				pool.MCPs[sname] = types.Entity{
-					ID:        "mcp:" + sname,
-					Name:      sname,
-					Type:      types.TypeMCP,
-					Domain:    classifier.ClassifyName(sname),
-					Path:      mc,
-					Scope:     "global",
-					CallCount: callCount,
-					Tier:      tier,
-					Status:    "configured",
+					ID:            "mcp:" + sname,
+					Name:          sname,
+					Type:          types.TypeMCP,
+					Domain:        classifier.ClassifyName(sname),
+					Path:          mc,
+					Scope:         "global",
+					CallCount:     callCount,
+					VerifiedCalls: verifiedCalls,
+					Tier:          tier,
+					Status:        "configured",
 				}
 			}
 		}
@@ -144,23 +150,26 @@ func ScanPool(db *types.TelemetryDB) (*types.Pool, error) {
 				sname := e.Name()
 				if _, exists := pool.MCPs[sname]; !exists {
 					var callCount int64 = 0
+					var verifiedCalls int64 = 0
 					tier := types.TierDormant
 					if db != nil {
 						if rec, ok := telemetry.GetRecord(db, types.TypeMCP, sname); ok {
 							callCount = rec.CallCount
+							verifiedCalls = rec.VerifiedCalls
 							tier = types.Tier(rec.Tier)
 						}
 					}
 					pool.MCPs[sname] = types.Entity{
-						ID:        "mcp:" + sname,
-						Name:      sname,
-						Type:      types.TypeMCP,
-						Domain:    classifier.ClassifyName(sname),
-						Path:      filepath.Join(mcpStorage, sname),
-						Scope:     "installed_bundle",
-						CallCount: callCount,
-						Tier:      tier,
-						Status:    "available",
+						ID:            "mcp:" + sname,
+						Name:          sname,
+						Type:          types.TypeMCP,
+						Domain:        classifier.ClassifyName(sname),
+						Path:          filepath.Join(mcpStorage, sname),
+						Scope:         "installed_bundle",
+						CallCount:     callCount,
+						VerifiedCalls: verifiedCalls,
+						Tier:          tier,
+						Status:        "available",
 					}
 				}
 			}
@@ -189,54 +198,84 @@ func ScanPool(db *types.TelemetryDB) (*types.Pool, error) {
 			if cliFilter[name] || strings.HasPrefix(name, "agent-kernel-") || strings.HasPrefix(name, "hostinger-") {
 				if _, exists := pool.CLIs[name]; !exists {
 					var callCount int64 = 0
+					var verifiedCalls int64 = 0
 					tier := types.TierDormant
 					if db != nil {
 						if rec, ok := telemetry.GetRecord(db, types.TypeCLI, name); ok {
 							callCount = rec.CallCount
+							verifiedCalls = rec.VerifiedCalls
 							tier = types.Tier(rec.Tier)
 						}
 					}
 
 					pool.CLIs[name] = types.Entity{
-						ID:        "cli:" + name,
-						Name:      name,
-						Type:      types.TypeCLI,
-						Domain:    classifier.ClassifyName(name),
-						Path:      filepath.Join(p, name),
-						Scope:     "system",
-						CallCount: callCount,
-						Tier:      tier,
-						Status:    "executable",
+						ID:            "cli:" + name,
+						Name:          name,
+						Type:          types.TypeCLI,
+						Domain:        classifier.ClassifyName(name),
+						Path:          filepath.Join(p, name),
+						Scope:         "system",
+						CallCount:     callCount,
+						VerifiedCalls: verifiedCalls,
+						Tier:          tier,
+						Status:        "executable",
 					}
 				}
 			}
 		}
 	}
 
-	// 4. Scan Agents
-	agentsList := []string{
-		"self", "research", "image-generator", "firestore-rules-author",
-		"fable-orchestrator", "agent-kernel-supervisor", "codex-subagent",
+	// 4. Discover actual agent definitions, then include observed runtime agents.
+	// Do not populate the dashboard with fabricated default agent names.
+	agentDirs := []string{
+		filepath.Join(home, ".claude", "agents"),
+		filepath.Join(home, ".agents", "agents"),
+		filepath.Join(home, ".codex", "agents"),
 	}
-	for _, aname := range agentsList {
-		var callCount int64 = 0
-		tier := types.TierDormant
-		if db != nil {
-			if rec, ok := telemetry.GetRecord(db, types.TypeAgent, aname); ok {
-				callCount = rec.CallCount
-				tier = types.Tier(rec.Tier)
-			}
+	for _, dir := range agentDirs {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
 		}
-		pool.Agents[aname] = types.Entity{
-			ID:        "agent:" + aname,
-			Name:      aname,
-			Type:      types.TypeAgent,
-			Domain:    types.DomainOrchestration,
-			Path:      "system:subagent",
-			Scope:     "runtime",
-			CallCount: callCount,
-			Tier:      tier,
-			Status:    "ready",
+		for _, entry := range entries {
+			if strings.HasPrefix(entry.Name(), ".") {
+				continue
+			}
+			if !entry.IsDir() && !strings.HasSuffix(entry.Name(), ".md") {
+				continue
+			}
+			name := strings.TrimSuffix(entry.Name(), ".md")
+			if _, exists := pool.Agents[name]; exists {
+				continue
+			}
+			item := types.Entity{
+				ID: "agent:" + name, Name: name, Type: types.TypeAgent,
+				Domain: types.DomainOrchestration, Path: filepath.Join(dir, entry.Name()),
+				Scope: "global", Tier: types.TierDormant, Status: "installed",
+			}
+			if record, ok := telemetry.GetRecord(db, types.TypeAgent, name); ok {
+				item.CallCount, item.VerifiedCalls = record.CallCount, record.VerifiedCalls
+				item.Tier = types.Tier(record.Tier)
+			}
+			pool.Agents[name] = item
+		}
+	}
+	if db != nil {
+		for key, record := range db.Entities {
+			if record.Type != string(types.TypeAgent) || record.VerifiedCalls == 0 {
+				continue
+			}
+			name := strings.TrimPrefix(key, "agent:")
+			if _, exists := pool.Agents[name]; exists {
+				continue
+			}
+			t := time.Unix(int64(record.LastSeen), 0)
+			pool.Agents[name] = types.Entity{
+				ID: "agent:" + name, Name: name, Type: types.TypeAgent,
+				Domain: types.DomainOrchestration, Scope: "observed_runtime",
+				Path: "", CallCount: record.CallCount, VerifiedCalls: record.VerifiedCalls,
+				Tier: types.Tier(record.Tier), LastSeen: &t, Status: "observed",
+			}
 		}
 	}
 

@@ -5,136 +5,179 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sync"
+	"strings"
+	"syscall"
 	"time"
 
 	"github.com/imMamdouhaboammar/skill-healer/pkg/types"
 )
 
-var (
-	dbLock sync.RWMutex
-)
-
-// DefaultDBPath returns ~/.ash/db/telemetry.json
 func DefaultDBPath() string {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return "/tmp/telemetry.json"
+		return filepath.Join(os.TempDir(), "ash-telemetry.json")
 	}
 	return filepath.Join(home, ".ash", "db", "telemetry.json")
 }
 
-// Load reads the telemetry database from disk.
+// Load reads a fully committed snapshot. Writers commit with an atomic rename.
 func Load(path string) (*types.TelemetryDB, error) {
-	dbLock.RLock()
-	defer dbLock.RUnlock()
-
 	if path == "" {
 		path = DefaultDBPath()
 	}
-
 	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return &types.TelemetryDB{
+			Version:     "1.0.0",
+			LastUpdated: float64(time.Now().Unix()),
+			Entities:    make(map[string]types.TelemetryRecord),
+		}, nil
+	}
 	if err != nil {
-		if os.IsNotExist(err) {
-			return &types.TelemetryDB{
-				Version:       "1.0.0",
-				LastUpdated:   float64(time.Now().Unix()),
-				TotalEntities: 0,
-				Entities:      make(map[string]types.TelemetryRecord),
-			}, nil
-		}
 		return nil, fmt.Errorf("reading telemetry db: %w", err)
 	}
-
 	var db types.TelemetryDB
 	if err := json.Unmarshal(data, &db); err != nil {
 		return nil, fmt.Errorf("parsing telemetry db: %w", err)
 	}
-
 	if db.Entities == nil {
 		db.Entities = make(map[string]types.TelemetryRecord)
 	}
-
 	return &db, nil
 }
 
-// Save writes the telemetry database to disk atomically.
-func Save(path string, db *types.TelemetryDB) error {
-	dbLock.Lock()
-	defer dbLock.Unlock()
-
-	if path == "" {
-		path = DefaultDBPath()
+// lockDatabase uses a kernel advisory lock shared by independent processes.
+func lockDatabase(path string) (func(), error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return nil, fmt.Errorf("creating db directory: %w", err)
 	}
+	lock, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, fmt.Errorf("opening db lock: %w", err)
+	}
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		_ = lock.Close()
+		return nil, fmt.Errorf("locking db: %w", err)
+	}
+	return func() {
+		_ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+		_ = lock.Close()
+	}, nil
+}
 
+// saveUnlocked must only be called while holding the database lock.
+func saveUnlocked(path string, db *types.TelemetryDB) error {
+	if db == nil {
+		return fmt.Errorf("nil telemetry db")
+	}
 	db.LastUpdated = float64(time.Now().Unix())
 	db.TotalEntities = len(db.Entities)
-
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-		return fmt.Errorf("creating db dir: %w", err)
-	}
-
 	data, err := json.MarshalIndent(db, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshaling telemetry db: %w", err)
 	}
-
-	tmpFile := path + ".tmp"
-	if err := os.WriteFile(tmpFile, data, 0644); err != nil {
-		return fmt.Errorf("writing tmp db: %w", err)
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".telemetry-*.tmp")
+	if err != nil {
+		return fmt.Errorf("creating temporary db: %w", err)
 	}
-
-	return os.Rename(tmpFile, path)
+	defer os.Remove(tmp.Name())
+	if _, err = tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("writing telemetry db: %w", err)
+	}
+	if err = tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("syncing telemetry db: %w", err)
+	}
+	if err = tmp.Close(); err != nil {
+		return fmt.Errorf("closing telemetry db: %w", err)
+	}
+	if err = os.Rename(tmp.Name(), path); err != nil {
+		return fmt.Errorf("committing telemetry db: %w", err)
+	}
+	return nil
 }
 
-// RecordInvocation records +1 call for an entity name and type.
+func Save(path string, db *types.TelemetryDB) error {
+	if path == "" {
+		path = DefaultDBPath()
+	}
+	unlock, err := lockDatabase(path)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	return saveUnlocked(path, db)
+}
+
+// RecordInvocation records caller-asserted usage and retains backward compatibility.
 func RecordInvocation(path string, entityType types.EntityType, name string) (*types.TelemetryRecord, error) {
+	return record(path, entityType, name, "")
+}
+
+// RecordObservedInvocation increments both the historical and verified counters.
+// Its source must be a concrete host hook or command shim.
+func RecordObservedInvocation(path string, entityType types.EntityType, name, source string) (*types.TelemetryRecord, error) {
+	if strings.TrimSpace(source) == "" {
+		return nil, fmt.Errorf("observed invocation requires source")
+	}
+	return record(path, entityType, name, source)
+}
+
+func record(path string, entityType types.EntityType, name, source string) (*types.TelemetryRecord, error) {
+	if path == "" {
+		path = DefaultDBPath()
+	}
+	if entityType != types.TypeCLI && entityType != types.TypeSkill && entityType != types.TypeMCP && entityType != types.TypeAgent {
+		return nil, fmt.Errorf("invalid entity type: %q", entityType)
+	}
+	name = strings.TrimSpace(name)
+	if name == "" || len(name) > 256 || strings.ContainsAny(name, "\r\n") {
+		return nil, fmt.Errorf("invalid entity name")
+	}
+	unlock, err := lockDatabase(path)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	db, err := Load(path)
 	if err != nil {
 		return nil, err
 	}
-
 	key := fmt.Sprintf("%s:%s", entityType, name)
 	now := float64(time.Now().Unix())
-
-	rec, exists := db.Entities[key]
-	if !exists {
-		rec = types.TelemetryRecord{
-			Name:          key,
-			Type:          string(entityType),
-			CallCount:     1,
-			FirstSeen:     now,
-			LastSeen:      now,
-			DaysSinceLast: 0,
-			Tier:          string(types.TierWarm),
-		}
-	} else {
-		rec.CallCount++
-		rec.LastSeen = now
-		rec.DaysSinceLast = 0
-		if rec.CallCount >= 10 {
-			rec.Tier = string(types.TierHot)
-		} else {
-			rec.Tier = string(types.TierWarm)
-		}
+	rec := db.Entities[key]
+	if rec.CallCount == 0 {
+		rec.FirstSeen = now
 	}
-
+	rec.Name, rec.Type = key, string(entityType)
+	rec.CallCount++
+	if source != "" {
+		rec.VerifiedCalls++
+		rec.LastSource = source
+	}
+	rec.LastSeen, rec.DaysSinceLast = now, 0
+	if rec.CallCount >= 10 {
+		rec.Tier = string(types.TierHot)
+	} else {
+		rec.Tier = string(types.TierWarm)
+	}
 	db.Entities[key] = rec
-	if err := Save(path, db); err != nil {
+	if err = saveUnlocked(path, db); err != nil {
 		return nil, err
 	}
-
 	return &rec, nil
 }
 
-// GetRecord returns telemetry for an entity if found.
 func GetRecord(db *types.TelemetryDB, entityType types.EntityType, name string) (types.TelemetryRecord, bool) {
-	key := fmt.Sprintf("%s:%s", entityType, name)
-	rec, ok := db.Entities[key]
-	if ok {
-		return rec, true
+	if db == nil {
+		return types.TelemetryRecord{}, false
 	}
-	// Fallback check by raw name
-	rec, ok = db.Entities[name]
-	return rec, ok
+	record, exists := db.Entities[fmt.Sprintf("%s:%s", entityType, name)]
+	if exists {
+		return record, true
+	}
+	// Legacy imports sometimes used unprefixed names. Require a matching type.
+	record, exists = db.Entities[name]
+	return record, exists && record.Type == string(entityType)
 }
