@@ -8,8 +8,12 @@ on:
 
 jobs:
   test:
-    name: Test and Build
-    runs-on: macos-latest
+    name: Test and Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ macos-latest, ubuntu-latest ]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -17,7 +21,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version: 'stable'
           check-latest: true
 
       - name: Verify dependencies
